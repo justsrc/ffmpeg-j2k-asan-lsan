@@ -1,0 +1,153 @@
+name: ASan and LSan
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+  LSAN_OPTIONS: exitcode=23
+  UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+jobs:
+  linux:
+    name: ${{ matrix.arch }} ASan+LSan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+    steps:
+      - name: Check out the JPEG 2000 series
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: justsrc/FFmpeg
+          ref: jpeg2000-native-perf-v2
+          path: ffmpeg
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld nasm yasm pkg-config ffmpeg
+
+      - name: Configure
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --toolchain=clang-asan \
+            --disable-everything \
+            --enable-demuxer=image2pipe \
+            --enable-parser=jpeg2000 \
+            --enable-decoder=jpeg2000 \
+            --enable-encoder=wrapped_avframe \
+            --enable-muxer=null \
+            --enable-protocol=file \
+            --enable-protocol=pipe \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-stripping \
+            --extra-cflags='-O1 -g'
+
+      - name: Build
+        working-directory: ffmpeg
+        run: |
+          make -j"$(nproc)" \
+            ffmpeg \
+            libavcodec/tests/jpeg2000dwt \
+            tests/checkasm/checkasm
+
+      - name: Verify LSan detects a deliberate leak
+        run: |
+          mkdir -p logs
+          printf '#include <stdlib.h>\nint main(void) { malloc(16); return 0; }\n' > /tmp/leak.c
+          clang -fsanitize=address -g /tmp/leak.c -o /tmp/leak
+          if output=$(/tmp/leak 2>&1); then
+            echo "::error::LSan did not fail on a deliberate leak"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep -q 'LeakSanitizer' <<<"$output"
+          echo "LSan is active"
+
+      - name: Generate JPEG 2000 samples
+        run: |
+          mkdir -p samples logs
+          enc() { ffmpeg -nostdin -v error "$@"; }
+
+          enc -f lavfi -i testsrc2=size=512x512:rate=1 -frames:v 1 \
+            -pix_fmt rgb24 -c:v jpeg2000 -pred dwt53 -format j2k \
+            samples/rgb8_dwt53_512.j2k
+          enc -f lavfi -i testsrc2=size=1024x768:rate=1 -frames:v 1 \
+            -pix_fmt rgb48le -c:v jpeg2000 -pred dwt97int -format j2k \
+            samples/rgb16_dwt97_1024x768.j2k
+          enc -f lavfi -i testsrc2=size=800x600:rate=1 -frames:v 1 \
+            -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format j2k \
+            samples/gbr12_dwt97_800x600.j2k
+          enc -f lavfi -i testsrc2=size=100x90:rate=1 -frames:v 1 \
+            -pix_fmt gray12le -c:v jpeg2000 -pred dwt97int -format j2k \
+            samples/gray12_dwt97_100x90.j2k
+          enc -f lavfi -i testsrc2=size=1024x768:rate=1 -frames:v 1 \
+            -pix_fmt rgb24 -c:v jpeg2000 -pred dwt53 \
+            -tile_width 256 -tile_height 256 -format j2k \
+            samples/rgb8_dwt53_tiled_1024x768.j2k
+          enc -f lavfi -i testsrc2=size=640x480:rate=1 -frames:v 1 \
+            -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format jp2 \
+            -f image2 samples/gbr12_dwt97_640x480.jp2
+          enc -f lavfi -i testsrc2=size=4096x1714:rate=1 -frames:v 1 \
+            -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format j2k \
+            samples/gbr12_dwt97_4096x1714.j2k
+
+          ls -l samples
+
+      - name: Decode samples under ASan and LSan
+        working-directory: ffmpeg
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in ../samples/*.j2k ../samples/*.jp2; do
+            name=$(basename "$f")
+            for threads in 1 4; do
+              echo "::group::$name threads=$threads"
+              if ! ./ffmpeg -nostdin -v error -threads "$threads" \
+                   -f image2pipe -c:v jpeg2000 -i "$f" -f null - \
+                   2>&1 | tee "../logs/${name}.t${threads}.log"; then
+                echo "::error::$name failed with threads=$threads"
+                fail=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$fail"
+
+      - name: Run the DWT reference test
+        working-directory: ffmpeg
+        run: |
+          set -o pipefail
+          ./libavcodec/tests/jpeg2000dwt 2>&1 | tee ../logs/jpeg2000dwt.log
+
+      - name: Run the JPEG 2000 DSP checkasm test
+        working-directory: ffmpeg
+        run: |
+          set -o pipefail
+          ./tests/checkasm/checkasm --test=jpeg2000dsp \
+            2>&1 | tee ../logs/checkasm-jpeg2000dsp.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: asan-lsan-${{ matrix.arch }}
+          path: logs/
+          if-no-files-found: warn
