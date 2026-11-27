@@ -158,7 +158,7 @@ jobs:
             name=$(basename "$f")
             for threads in 1 4 8; do
               echo "::group::$name threads=$threads"
-              if ! ./ffmpeg -nostdin -v error -threads "$threads" \
+              if ! ./ffmpeg -nostdin -v error -xerror -threads "$threads" \
                    -f image2pipe -c:v jpeg2000 -i "$f" -f null - \
                    2>&1 | tee "../logs/${name}.t${threads}.log"; then
                 echo "::error::$name failed with threads=$threads"
@@ -175,7 +175,7 @@ jobs:
           set -uo pipefail
           for threads in 1 8; do
             echo "::group::rgb16_float97 packed threads=$threads"
-            ./ffmpeg -nostdin -v error -threads "$threads" \
+            ./ffmpeg -nostdin -v error -xerror -threads "$threads" \
               -f image2pipe -c:v jpeg2000 \
               -i ../samples/rgb16_float97_1024x768.j2k \
               -pix_fmt rgb48le -f null - \
@@ -198,13 +198,30 @@ jobs:
           fail=0
           for threads in 1 4 8; do
             echo "::group::corpus 4096x1714 xyz12 threads=$threads"
-            if ! ./ffmpeg -nostdin -v error -threads "$threads" \
+            if ! ./ffmpeg -nostdin -v error -xerror -threads "$threads" \
                  -f image2pipe -c:v jpeg2000 -i ../corpus.j2kpipe \
+                 -progress "../logs/corpus.t${threads}.progress" \
                  -f null - 2>&1 | tee "../logs/corpus.t${threads}.log"; then
               echo "::error::4K corpus failed with threads=$threads"
               fail=1
             fi
             echo "::endgroup::"
+          done
+          exit "$fail"
+
+      - name: Verify the corpus decoded all 240 frames
+        if: always()
+        working-directory: ffmpeg
+        run: |
+          fail=0
+          for threads in 1 4 8; do
+            progress="../logs/corpus.t${threads}.progress"
+            if ! grep -qx 'frame=240' "$progress" ||
+               ! grep -qx 'progress=end' "$progress"; then
+              echo "::error::corpus threads=$threads did not reach frame 240"
+              tail -5 "$progress" 2>/dev/null || true
+              fail=1
+            fi
           done
           exit "$fail"
 
