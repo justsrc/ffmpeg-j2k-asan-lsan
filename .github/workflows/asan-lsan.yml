@@ -24,39 +24,39 @@ jobs:
     name: Select refs
     runs-on: ubuntu-26.04
     outputs:
-      refs: ${{ steps.refs.outputs.refs }}
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
-      - id: refs
+      - id: targets
         env:
           REF: ${{ inputs.ref }}
         run: |
           if [ -n "$REF" ]; then
-            printf 'refs=["%s"]\n' "$REF" >> "$GITHUB_OUTPUT"
+            slug=$(printf '%s' "$REF" | tr '/' '-')
+            printf 'targets=[{"ref":"%s","slug":"%s"}]\n' "$REF" "$slug"
           else
-            printf 'refs=["perf/j2k-dwt","perf/j2k-tier1","ci/j2k-combined"]\n' \
-              >> "$GITHUB_OUTPUT"
-          fi
+            printf 'targets=[{"ref":"perf/j2k-dwt","slug":"dwt"},{"ref":"perf/j2k-tier1","slug":"tier1"},{"ref":"ci/j2k-combined","slug":"combined"}]\n'
+          fi >> "$GITHUB_OUTPUT"
 
   linux:
-    name: ${{ matrix.arch.name }} ${{ matrix.ref }} ASan+LSan
+    name: ${{ matrix.arch.name }} ${{ matrix.target.ref }} ASan+LSan
     needs: setup
     runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        ref: ${{ fromJSON(needs.setup.outputs.refs) }}
+        target: ${{ fromJSON(needs.setup.outputs.targets) }}
         arch:
           - runner: ubuntu-26.04
             name: x86_64
           - runner: ubuntu-26.04-arm
             name: arm64
     steps:
-      - name: Check out ${{ matrix.ref }}
+      - name: Check out ${{ matrix.target.ref }}
         uses: actions/checkout@v7.0.1
         with:
           repository: justsrc/FFmpeg
-          ref: ${{ matrix.ref }}
+          ref: ${{ matrix.target.ref }}
           path: ffmpeg
           fetch-depth: 1
           persist-credentials: false
@@ -203,6 +203,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: asan-lsan-${{ matrix.arch.name }}-${{ replace(matrix.ref, '/', '-') }}
+          name: asan-lsan-${{ matrix.arch.name }}-${{ matrix.target.slug }}
           path: logs/
           if-no-files-found: warn
