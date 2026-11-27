@@ -430,6 +430,8 @@ jobs:
           echo "8fd38e74779bb41f6e4ba44d5839a578b3917e430b5dc63fd3fd40e735c10667  fuzz-corpus.tar.gz" \
             | sha256sum -c -
           tar -xzf fuzz-corpus.tar.gz
+          find fuzz-corpus -name '._*' -delete
+          echo "inputs=$(find fuzz-corpus -type f | wc -l)"
 
       - name: Run the malformed corpus under ASan and LSan
         run: |

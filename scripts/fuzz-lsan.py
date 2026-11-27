@@ -71,6 +71,9 @@ files = sorted(
     os.path.join(root, name)
     for root, _, names in os.walk(inputs)
     for name in names
+    # macOS tar can materialise extended attributes as AppleDouble files;
+    # they are metadata, not JPEG 2000 inputs.
+    if not name.startswith("._")
 )
 results = []
 with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
