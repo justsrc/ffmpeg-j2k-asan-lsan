@@ -347,3 +347,101 @@ jobs:
           name: fate-${{ matrix.arch.name }}-${{ matrix.target.slug }}
           path: logs/
           if-no-files-found: warn
+
+  fuzz:
+    name: ${{ matrix.arch.name }} ${{ matrix.target.ref }} fuzz+LSan
+    needs: setup
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.setup.outputs.targets) }}
+        arch:
+          - runner: ubuntu-26.04
+            name: x86_64
+          - runner: ubuntu-26.04-arm
+            name: arm64
+    steps:
+      - name: Check out ${{ matrix.target.ref }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: justsrc/FFmpeg
+          ref: ${{ matrix.target.ref }}
+          path: ffmpeg
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the harness scripts
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: harness
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld nasm yasm pkg-config
+
+      - name: Configure
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --toolchain=clang-asan \
+            --disable-everything \
+            --enable-demuxer=image2pipe \
+            --enable-parser=jpeg2000 \
+            --enable-decoder=jpeg2000 \
+            --enable-encoder=wrapped_avframe \
+            --enable-muxer=null \
+            --enable-protocol=file \
+            --enable-protocol=pipe \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-stripping \
+            --extra-cflags='-O1 -g -fno-omit-frame-pointer'
+
+      - name: Build
+        working-directory: ffmpeg
+        run: make -j"$(nproc)" ffmpeg
+
+      - name: Verify LSan detects a deliberate leak
+        run: |
+          mkdir -p logs
+          printf '#include <stdlib.h>\nint main(void) { malloc(16); return 0; }\n' > /tmp/leak.c
+          clang -fsanitize=address -g /tmp/leak.c -o /tmp/leak
+          if output=$(/tmp/leak 2>&1); then
+            echo "::error::LSan did not fail on a deliberate leak"
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          grep -q 'LeakSanitizer' <<<"$output"
+          echo "LSan is active"
+
+      - name: Download the malformed corpus
+        run: |
+          curl -fsSL --retry 3 \
+            -o fuzz-corpus.tar.gz \
+            https://github.com/justsrc/ffmpeg-j2k-asan-lsan/releases/download/j2k-fuzz-corpus-2026-11-27/j2k-fuzz-corpus.tar.gz
+          echo "8fd38e74779bb41f6e4ba44d5839a578b3917e430b5dc63fd3fd40e735c10667  fuzz-corpus.tar.gz" \
+            | sha256sum -c -
+          tar -xzf fuzz-corpus.tar.gz
+
+      - name: Run the malformed corpus under ASan and LSan
+        run: |
+          set -o pipefail
+          python3 harness/scripts/fuzz-lsan.py \
+            "$PWD/ffmpeg/ffmpeg" "$PWD/fuzz-corpus" "$PWD/logs/fuzz-lsan.json" \
+            2>&1 | tee logs/fuzz-lsan.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: fuzz-${{ matrix.arch.name }}-${{ matrix.target.slug }}
+          path: logs/
+          if-no-files-found: warn
