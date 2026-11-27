@@ -4,34 +4,59 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Single FFmpeg ref to test (empty = all three)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 env:
   ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
-  LSAN_OPTIONS: exitcode=23
+  LSAN_OPTIONS: exitcode=23:report_objects=1
   UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
 jobs:
+  setup:
+    name: Select refs
+    runs-on: ubuntu-26.04
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - id: refs
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$REF" ]; then
+            printf 'refs=["%s"]\n' "$REF" >> "$GITHUB_OUTPUT"
+          else
+            printf 'refs=["perf/j2k-dwt","perf/j2k-tier1","ci/j2k-combined"]\n' \
+              >> "$GITHUB_OUTPUT"
+          fi
+
   linux:
-    name: ${{ matrix.arch }} ASan+LSan
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.arch.name }} ${{ matrix.ref }} ASan+LSan
+    needs: setup
+    runs-on: ${{ matrix.arch.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
+        ref: ${{ fromJSON(needs.setup.outputs.refs) }}
+        arch:
           - runner: ubuntu-26.04
-            arch: x86_64
+            name: x86_64
           - runner: ubuntu-26.04-arm
-            arch: arm64
+            name: arm64
     steps:
-      - name: Check out the JPEG 2000 series
+      - name: Check out ${{ matrix.ref }}
         uses: actions/checkout@v7.0.1
         with:
           repository: justsrc/FFmpeg
-          ref: jpeg2000-native-perf-v2
+          ref: ${{ matrix.ref }}
           path: ffmpeg
           fetch-depth: 1
           persist-credentials: false
@@ -40,7 +65,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang lld nasm yasm pkg-config ffmpeg
+            build-essential clang lld nasm yasm pkg-config ffmpeg \
+            libopenjp2-tools
 
       - name: Configure
         working-directory: ffmpeg
@@ -58,7 +84,7 @@ jobs:
             --disable-autodetect \
             --disable-doc \
             --disable-stripping \
-            --extra-cflags='-O1 -g'
+            --extra-cflags='-O1 -g -fno-omit-frame-pointer'
 
       - name: Build
         working-directory: ffmpeg
@@ -67,6 +93,9 @@ jobs:
             ffmpeg \
             libavcodec/tests/jpeg2000dwt \
             tests/checkasm/checkasm
+          if [ -f libavcodec/tests/mqc.c ]; then
+            make -j"$(nproc)" libavcodec/tests/mqc
+          fi
 
       - name: Verify LSan detects a deliberate leak
         run: |
@@ -105,9 +134,18 @@ jobs:
           enc -f lavfi -i testsrc2=size=640x480:rate=1 -frames:v 1 \
             -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format jp2 \
             -f image2 samples/gbr12_dwt97_640x480.jp2
-          enc -f lavfi -i testsrc2=size=4096x1714:rate=1 -frames:v 1 \
+          enc -f lavfi -i testsrc2=size=4096x1714:rate=1 -frames:v 3 \
             -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format j2k \
             samples/gbr12_dwt97_4096x1714.j2k
+
+          # The native encoder only writes the integer 9/7 transform; the
+          # decoder's float 9/7 path and the packed 16-bit writer need an
+          # irreversible OpenJPEG codestream.
+          enc -f lavfi -i testsrc2=size=1024x768:rate=1 -frames:v 1 \
+            -pix_fmt rgb48le samples/float97_src.png
+          opj_compress -i samples/float97_src.png \
+            -o samples/rgb16_float97_1024x768.j2k -I -r 20
+          rm -f samples/float97_src.png
 
           ls -l samples
 
@@ -118,7 +156,7 @@ jobs:
           fail=0
           for f in ../samples/*.j2k ../samples/*.jp2; do
             name=$(basename "$f")
-            for threads in 1 4; do
+            for threads in 1 4 8; do
               echo "::group::$name threads=$threads"
               if ! ./ffmpeg -nostdin -v error -threads "$threads" \
                    -f image2pipe -c:v jpeg2000 -i "$f" -f null - \
@@ -131,11 +169,28 @@ jobs:
           done
           exit "$fail"
 
-      - name: Run the DWT reference test
+      - name: Decode the float 9/7 sample with packed output
+        working-directory: ffmpeg
+        run: |
+          set -uo pipefail
+          for threads in 1 8; do
+            echo "::group::rgb16_float97 packed threads=$threads"
+            ./ffmpeg -nostdin -v error -threads "$threads" \
+              -f image2pipe -c:v jpeg2000 \
+              -i ../samples/rgb16_float97_1024x768.j2k \
+              -pix_fmt rgb48le -f null - \
+              2>&1 | tee "../logs/rgb16_float97_packed.t${threads}.log"
+            echo "::endgroup::"
+          done
+
+      - name: Run the DWT and MQ reference tests
         working-directory: ffmpeg
         run: |
           set -o pipefail
           ./libavcodec/tests/jpeg2000dwt 2>&1 | tee ../logs/jpeg2000dwt.log
+          if [ -x ./libavcodec/tests/mqc ]; then
+            ./libavcodec/tests/mqc 2>&1 | tee ../logs/mqc.log
+          fi
 
       - name: Run the JPEG 2000 DSP checkasm test
         working-directory: ffmpeg
@@ -148,6 +203,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: asan-lsan-${{ matrix.arch }}
+          name: asan-lsan-${{ matrix.arch.name }}-${{ replace(matrix.ref, '/', '-') }}
           path: logs/
           if-no-files-found: warn
