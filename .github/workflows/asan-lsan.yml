@@ -135,8 +135,8 @@ jobs:
             -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format jp2 \
             -f image2 samples/gbr12_dwt97_640x480.jp2
           enc -f lavfi -i testsrc2=size=4096x1714:rate=1 -frames:v 3 \
-            -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int -format j2k \
-            samples/gbr12_dwt97_4096x1714.j2k
+            -pix_fmt gbrp12le -c:v jpeg2000 -pred dwt97int \
+            -f image2 -format j2k samples/gbr12_dwt97_4096x1714_%03d.j2k
 
           # The native encoder only writes the integer 9/7 transform; the
           # decoder's float 9/7 path and the packed 16-bit writer need an
