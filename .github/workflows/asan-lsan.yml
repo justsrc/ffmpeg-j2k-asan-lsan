@@ -183,6 +183,31 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: Download the 4K DCP corpus
+        run: |
+          curl -fsSL --retry 3 \
+            -o corpus.j2kpipe \
+            https://github.com/justsrc/ffmpeg-j2k-asan-lsan/releases/download/j2k-corpus-2026-11-27/corpus.j2kpipe
+          echo "f19a668d861c41745ab644fc0df7557c1c7974de89a9d441c5d389b8b21a42ae  corpus.j2kpipe" \
+            | sha256sum -c -
+
+      - name: Decode the 4K DCP corpus under ASan and LSan
+        working-directory: ffmpeg
+        run: |
+          set -uo pipefail
+          fail=0
+          for threads in 1 4 8; do
+            echo "::group::corpus 4096x1714 xyz12 threads=$threads"
+            if ! ./ffmpeg -nostdin -v error -threads "$threads" \
+                 -f image2pipe -c:v jpeg2000 -i ../corpus.j2kpipe \
+                 -f null - 2>&1 | tee "../logs/corpus.t${threads}.log"; then
+              echo "::error::4K corpus failed with threads=$threads"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$fail"
+
       - name: Run the DWT and MQ reference tests
         working-directory: ffmpeg
         run: |
@@ -204,5 +229,104 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: asan-lsan-${{ matrix.arch.name }}-${{ matrix.target.slug }}
+          path: logs/
+          if-no-files-found: warn
+
+  fate:
+    name: ${{ matrix.arch.name }} ${{ matrix.target.ref }} FATE+LSan
+    needs: setup
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.setup.outputs.targets) }}
+        arch:
+          - runner: ubuntu-26.04
+            name: x86_64
+          - runner: ubuntu-26.04-arm
+            name: arm64
+    steps:
+      - name: Check out ${{ matrix.target.ref }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: justsrc/FFmpeg
+          ref: ${{ matrix.target.ref }}
+          path: ffmpeg
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld nasm yasm pkg-config
+
+      - name: Configure
+        working-directory: ffmpeg
+        run: |
+          ./configure \
+            --toolchain=clang-asan \
+            --disable-everything \
+            --enable-demuxer=image2 \
+            --enable-demuxer=image2pipe \
+            --enable-demuxer=image_j2k_pipe \
+            --enable-demuxer=mxf \
+            --enable-parser=jpeg2000 \
+            --enable-decoder=jpeg2000 \
+            --enable-encoder=pcm_s16le \
+            --enable-encoder=rawvideo \
+            --enable-muxer=framecrc \
+            --enable-muxer=null \
+            --enable-filter=scale \
+            --enable-swscale \
+            --enable-protocol=file \
+            --enable-protocol=pipe \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-stripping \
+            --extra-cflags='-O1 -g -fno-omit-frame-pointer'
+
+      - name: Build
+        working-directory: ffmpeg
+        run: make -j"$(nproc)" ffmpeg ffprobe
+
+      - name: Download the ITU-T T.803 conformance samples
+        run: |
+          mkdir -p fate-suite/jpeg2000/itu-iso/codestreams_profile0 \
+                   fate-suite/jpeg2000/itu-iso/htj2k_bsets_profile0 logs
+          base=https://fate-suite.ffmpeg.org/jpeg2000
+          for n in 01 02 03 04 05 07 08 09 10 11 12 14 15 16; do
+            curl -fsSL --retry 3 \
+              "$base/itu-iso/codestreams_profile0/p0_${n}.j2k" \
+              -o "fate-suite/jpeg2000/itu-iso/codestreams_profile0/p0_${n}.j2k"
+          done
+          curl -fsSL --retry 3 \
+            "$base/itu-iso/htj2k_bsets_profile0/ds0_ht_01_b11.j2k" \
+            -o fate-suite/jpeg2000/itu-iso/htj2k_bsets_profile0/ds0_ht_01_b11.j2k
+          curl -fsSL --retry 3 \
+            "$base/chiens_dcinema2K.mxf" \
+            -o fate-suite/jpeg2000/chiens_dcinema2K.mxf
+          du -sh fate-suite
+
+      - name: Run the JPEG 2000 FATE tests under ASan and LSan
+        working-directory: ffmpeg
+        run: |
+          set -o pipefail
+          make fate-jpeg2000dec SAMPLES="$PWD/../fate-suite" \
+            2>&1 | tee ../logs/fate-jpeg2000dec.log
+
+      - name: Collect the FATE reports
+        if: always()
+        working-directory: ffmpeg
+        run: |
+          mkdir -p ../logs/fate-reports
+          cp -a tests/data/fate/. ../logs/fate-reports/ 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: fate-${{ matrix.arch.name }}-${{ matrix.target.slug }}
           path: logs/
           if-no-files-found: warn
